@@ -20,6 +20,7 @@ namespace esphome
       protected:
         uint32_t temperature_publish_time_{300000};
         uint32_t temperature_last_publish_time_{0};
+        bool temperature_published_{false};
 
         uint8_t power_state_{0};
         uint8_t swing_{0};

@@ -382,11 +382,13 @@ namespace esphome
       int current_temperature = decode_room_temperature(message[8]);
       ESP_LOGD(TAG, "Current temperature: %d (raw %d)", current_temperature, message[8]);
       // checks that temperature is different AND that the publish time interval has passed
+      // (the first value after boot is published right away)
       if (current_temperature != this->current_temperature_)
       {
-        if (this->temperature_last_publish_time_ + this->temperature_publish_time_ <= millis())
+        if (!this->temperature_published_ || this->temperature_last_publish_time_ + this->temperature_publish_time_ <= millis())
         {
           ESP_LOGD(TAG, "Temperature update time has lapsed. Sending update...");
+          this->temperature_published_ = true;
           this->temperature_last_publish_time_ = millis();
           this->current_temperature_ = current_temperature;
           this->current_temperature = current_temperature;
