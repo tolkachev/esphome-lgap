@@ -13,6 +13,28 @@ namespace esphome
     static const uint8_t MIN_TEMPERATURE = 16;
     static const uint8_t MAX_TEMPERATURE = 36;
 
+    // LGAP room temperature table (LGAP.pdf, "3. Room Temperature Table"):
+    // first raw value of each degree, from 40 °C (raw 76) down to 10 °C (raw 160..162)
+    static const uint8_t ROOM_TEMPERATURE_RAW[] = {
+        76, 78, 80, 83, 85, 87, 90, 93, 95, 98, 100, 103, 106, 109, 112, 114,
+        117, 120, 123, 126, 129, 132, 135, 138, 142, 145, 148, 151, 154, 157, 160};
+    static const int ROOM_TEMPERATURE_MAX = 40;
+
+    static int decode_room_temperature(uint8_t raw)
+    {
+      if (raw < ROOM_TEMPERATURE_RAW[0])
+        return ROOM_TEMPERATURE_MAX;
+
+      int degrees_below_max = 0;
+      for (size_t i = 0; i < sizeof(ROOM_TEMPERATURE_RAW); i++)
+      {
+        if (raw < ROOM_TEMPERATURE_RAW[i])
+          break;
+        degrees_below_max = i;
+      }
+      return ROOM_TEMPERATURE_MAX - degrees_below_max;
+    }
+
     void LGAPHVACClimate::dump_config()
     {
       ESP_LOGCONFIG(TAG, "LGAP HVAC:");
@@ -356,11 +378,9 @@ namespace esphome
         publish_update = true;
       }
 
-      // current temp
-      // TODO: implement precision setting for reported temperature
-      // int current_temperature = ((70 - message[8] * 100.0 / 256.0)) / 100.0;
-      int current_temperature = (message[8] & 0xf) + 15;
-      ESP_LOGD(TAG, "Current temperature: %d", current_temperature);
+      // current temp: byte 8 is a raw 0-255 value, mapped by the LGAP room temperature table
+      int current_temperature = decode_room_temperature(message[8]);
+      ESP_LOGD(TAG, "Current temperature: %d (raw %d)", current_temperature, message[8]);
       // checks that temperature is different AND that the publish time interval has passed
       if (current_temperature != this->current_temperature_)
       {
