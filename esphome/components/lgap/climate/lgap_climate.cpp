@@ -18,22 +18,35 @@ namespace esphome
     static const uint8_t ROOM_TEMPERATURE_RAW[] = {
         76, 78, 80, 83, 85, 87, 90, 93, 95, 98, 100, 103, 106, 109, 112, 114,
         117, 120, 123, 126, 129, 132, 135, 138, 142, 145, 148, 151, 154, 157, 160};
+    static const uint8_t ROOM_TEMPERATURE_RAW_END = 163; // first raw value after 10 °C
     static const int ROOM_TEMPERATURE_MAX = 40;
 
-    static int decode_room_temperature(uint8_t raw)
+    // A degree spans 2-4 raw values: interpolate inside it and round to 0.5 °C,
+    // so a room sitting on a degree boundary reads e.g. 21.5 instead of flicking 21/22.
+    static float decode_room_temperature(uint8_t raw)
     {
+      const size_t count = sizeof(ROOM_TEMPERATURE_RAW);
       if (raw < ROOM_TEMPERATURE_RAW[0])
         return ROOM_TEMPERATURE_MAX;
 
-      int degrees_below_max = 0;
-      for (size_t i = 0; i < sizeof(ROOM_TEMPERATURE_RAW); i++)
-      {
-        if (raw < ROOM_TEMPERATURE_RAW[i])
-          break;
-        degrees_below_max = i;
-      }
-      return ROOM_TEMPERATURE_MAX - degrees_below_max;
+      size_t i = 0;
+      while (i + 1 < count && raw >= ROOM_TEMPERATURE_RAW[i + 1])
+        i++;
+
+      uint8_t start = ROOM_TEMPERATURE_RAW[i];
+      uint8_t end = (i + 1 < count) ? ROOM_TEMPERATURE_RAW[i + 1] : ROOM_TEMPERATURE_RAW_END;
+      if (raw >= end)
+        return ROOM_TEMPERATURE_MAX - (float)i;
+
+      float temperature = (ROOM_TEMPERATURE_MAX - (float)i) + 0.5f - (raw - start + 0.5f) / (end - start);
+      return roundf(temperature * 2) / 2;
     }
+
+    // LGAP.pdf fan speed: Low(1), Middle(2), High(3), Auto(4)
+    static const uint8_t FAN_SPEED_LOW = 1;
+    static const uint8_t FAN_SPEED_MEDIUM = 2;
+    static const uint8_t FAN_SPEED_HIGH = 3;
+    static const uint8_t FAN_SPEED_AUTO = 4;
 
     void LGAPHVACClimate::dump_config()
     {
@@ -95,6 +108,7 @@ namespace esphome
       });
 
       traits.set_supported_fan_modes({
+          climate::CLIMATE_FAN_AUTO,
           climate::CLIMATE_FAN_LOW,
           climate::CLIMATE_FAN_MEDIUM,
           climate::CLIMATE_FAN_HIGH,
@@ -108,7 +122,8 @@ namespace esphome
       // todo: validate these min/max numbers
       traits.set_visual_min_temperature(MIN_TEMPERATURE);
       traits.set_visual_max_temperature(MAX_TEMPERATURE);
-      traits.set_visual_temperature_step(1);
+      traits.set_visual_target_temperature_step(1);
+      traits.set_visual_current_temperature_step(0.5);
       return traits;
     }
 
@@ -159,7 +174,7 @@ namespace esphome
         }
 
         // Publish updated state
-        this->write_update_pending = true;
+        this->request_write();
         this->mode = mode;
         this->publish_state();
       }
@@ -174,24 +189,23 @@ namespace esphome
         {
           if (fan_mode == climate::CLIMATE_FAN_AUTO)
           {
-            // auto fan is actually not supported right now, so we set it to Low
-            this->fan_speed_ = 0;
+            this->fan_speed_ = FAN_SPEED_AUTO;
           }
           else if (fan_mode == climate::CLIMATE_FAN_LOW)
           {
-            this->fan_speed_ = 0;
+            this->fan_speed_ = FAN_SPEED_LOW;
           }
           else if (fan_mode == climate::CLIMATE_FAN_MEDIUM)
           {
-            this->fan_speed_ = 1;
+            this->fan_speed_ = FAN_SPEED_MEDIUM;
           }
           else if (fan_mode == climate::CLIMATE_FAN_HIGH)
           {
-            this->fan_speed_ = 2;
+            this->fan_speed_ = FAN_SPEED_HIGH;
           }
 
           // publish state
-          this->write_update_pending = true;
+          this->request_write();
           this->fan_mode = fan_mode;
           this->publish_state();
         }
@@ -215,7 +229,7 @@ namespace esphome
           }
 
           // publish state
-          this->write_update_pending = true;
+          this->request_write();
           this->swing_mode = swing_mode;
           this->publish_state();
         }
@@ -233,7 +247,7 @@ namespace esphome
           this->target_temperature = temp;
         }
 
-        this->write_update_pending = true;
+        this->request_write();
         this->publish_state();
       }
     }
@@ -272,6 +286,12 @@ namespace esphome
 
       bool publish_update = false;
 
+      // while a command is on its way (and shortly after), the unit can still report the state
+      // from before it: applying that would drop the command, so only the room temperature is taken
+      bool state_held = this->is_state_held();
+      if (state_held)
+        ESP_LOGD(TAG, "Command pending for zone %d, not applying the reported state", this->zone_number);
+
       // process clean message as checksum already checked before reaching this point
       uint8_t power_state = (message[1] & 1);
       uint8_t mode = (message[6] & 7);
@@ -279,7 +299,7 @@ namespace esphome
       // power state and mode
       // home assistant climate treats them as a single entity
       // this logic combines them from lgap into a single entity
-      if (power_state != this->power_state_ || mode != this->mode_)
+      if (!state_held && (power_state != this->power_state_ || mode != this->mode_))
       {
         // handle mode
         if (mode == 0)
@@ -323,7 +343,7 @@ namespace esphome
 
       // swing options
       uint8_t swing = (message[6] >> 3) & 1;
-      if (swing != this->swing_)
+      if (!state_held && swing != this->swing_)
       {
         if (swing == 0)
         {
@@ -345,23 +365,27 @@ namespace esphome
 
       // fan speed
       uint8_t fan_speed = ((message[6] >> 4) & 7);
-      if (fan_speed != this->fan_speed_)
+      if (!state_held && fan_speed != this->fan_speed_)
       {
-        if (fan_speed == 0)
+        if (fan_speed == FAN_SPEED_LOW)
         {
           this->fan_mode = climate::CLIMATE_FAN_LOW;
         }
-        else if (fan_speed == 1)
+        else if (fan_speed == FAN_SPEED_MEDIUM)
         {
           this->fan_mode = climate::CLIMATE_FAN_MEDIUM;
         }
-        else if (fan_speed == 2)
+        else if (fan_speed == FAN_SPEED_HIGH)
         {
           this->fan_mode = climate::CLIMATE_FAN_HIGH;
         }
+        else if (fan_speed == FAN_SPEED_AUTO)
+        {
+          this->fan_mode = climate::CLIMATE_FAN_AUTO;
+        }
         else
         {
-          ESP_LOGE(TAG, "Invalid fan speed received: %d", fan_speed);
+          ESP_LOGW(TAG, "Unknown fan speed received: %d", fan_speed);
         }
 
         // update state
@@ -371,7 +395,7 @@ namespace esphome
 
       // target temp
       int target_temperature = (message[7] & 0xf) + 15;
-      if (target_temperature != this->target_temperature_)
+      if (!state_held && target_temperature != this->target_temperature_)
       {
         this->target_temperature_ = target_temperature;
         this->target_temperature = target_temperature;
@@ -379,8 +403,8 @@ namespace esphome
       }
 
       // current temp: byte 8 is a raw 0-255 value, mapped by the LGAP room temperature table
-      int current_temperature = decode_room_temperature(message[8]);
-      ESP_LOGD(TAG, "Current temperature: %d (raw %d)", current_temperature, message[8]);
+      float current_temperature = decode_room_temperature(message[8]);
+      ESP_LOGD(TAG, "Current temperature: %.1f (raw %d)", current_temperature, message[8]);
       // checks that temperature is different AND that the publish time interval has passed
       // (the first value after boot is published right away)
       if (current_temperature != this->current_temperature_)

@@ -9,6 +9,9 @@ namespace esphome
 {
   namespace lgap
   {
+    // after the last control frame the unit may still report its previous state for a moment
+    static const uint32_t STATE_HOLD_TIME_MS = 5000;
+
     float LGAP::get_setup_priority() const { return setup_priority::DATA; }
 
     void LGAP::dump_config()
@@ -101,11 +104,19 @@ namespace esphome
           if (this->flow_control_pin_ != nullptr)
             this->flow_control_pin_->digital_write(false);
 
-          // update device state
-          if (this->devices_[this->last_zone_checked_index_]->write_update_pending == true)
+          // update device state: keep writing until the control frame went out 3 times,
+          // then hold the reported state for a moment, the unit can still answer with the old one
+          auto *device = this->devices_[this->last_zone_checked_index_];
+          if (device->write_update_pending == true)
           {
-            ESP_LOGV(TAG, "Disabling write flag for zone %d", this->devices_[this->last_zone_checked_index_]->zone_number);
-            this->devices_[this->last_zone_checked_index_]->write_update_pending = false;
+            if (device->write_repeats_left > 0)
+              device->write_repeats_left--;
+            if (device->write_repeats_left == 0)
+            {
+              ESP_LOGV(TAG, "Disabling write flag for zone %d", device->zone_number);
+              device->write_update_pending = false;
+              device->state_hold_until = millis() + STATE_HOLD_TIME_MS;
+            }
           }
 
           // update state for last request
